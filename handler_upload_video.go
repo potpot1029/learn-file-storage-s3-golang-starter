@@ -1,19 +1,54 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	buf := new(bytes.Buffer)
+	cmd.Stdout = buf
+
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	type VideoInfo struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+
+	var videoInfo VideoInfo
+	if err = json.Unmarshal(buf.Bytes(), &videoInfo); err != nil {
+		return "", err
+	}
+
+	if videoInfo.Streams[0].Width/16 == videoInfo.Streams[0].Height/9 {
+		return "16:9", nil
+	} else if videoInfo.Streams[0].Width/9 == videoInfo.Streams[0].Height/16 {
+		return "9:16", nil
+	} else {
+		return "other", nil
+	}
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	const maxMemory = 1 << 30
@@ -87,6 +122,21 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error getting aspect ratio of the video", err)
+		return
+	}
+
+	var orientation string
+	if aspectRatio == "16:9" {
+		orientation = "landscape"
+	} else if aspectRatio == "9:16" {
+		orientation = "portrait"
+	} else {
+		orientation = "other"
+	}
+
 	// random ID generation
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
@@ -95,7 +145,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	id := base64.RawURLEncoding.EncodeToString(key)
 	fileExtension := strings.Split(mediatype, "/")[1]
-	fileName := fmt.Sprintf("%v.%v", id, fileExtension)
+	fileName := fmt.Sprintf("%v/%v.%v", orientation, id, fileExtension)
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
